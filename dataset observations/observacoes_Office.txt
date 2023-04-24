@@ -1,0 +1,27 @@
+1. Pairwise registration of Office clouds works better with tuple_scale set to 0.98 instead of 0.95.
+This is probably because the strong minimuns induced by simmetryes.
+
+2. Todos os pares foram corretamente registrados utilizando os seguintes parametros do FGR
+kd_tree_FPFH = radius=10*voxel_size; max_nn=500
+division_factor = 1.4,        # padrao: 1.4
+use_absolute_scale = False,   # padrao: False
+decrease_mu = True,           # padrao: False
+maximum_correspondence_distance = 2.5*voxel_size
+iteration_number = 300,       # padrao: 64
+tuple_scale      = 0.95,      # padrao: 0.95
+maximum_tuple_count = int(0.2*n_pontos)) # padrao: 1000
+
+Nâo significa que o FGR foi bom em todos os pares, apenas que o erro não foi grande o suficiente
+para impedir a correção pelo M-GICP. Após rodar novamente, deu ruim em 2 dos 5 pares, que estavam flipados.
+
+O QUE INFLUENCIA NO TEMPO:
+
+3. Mudar o raio do FPFH e a quantidade de pontos aumenta drasticamente o tempo de 30 
+para 55 segundos por par.
+
+4. Mudar a quantidade de iteracoes para de 150 para 300 e a quantidade de tuplas de 2000 para 4500 não
+teve influência no tempo de registro dos pares.
+
+5. Após inúmeros teste, realmente o dataset Office se beneficia mais de um tuple_scale = 0.97 ou 0.98.
+
+6. Após mudar os parâmetros testando para Arch, os resultados em Office, aparentemente, pioraram.

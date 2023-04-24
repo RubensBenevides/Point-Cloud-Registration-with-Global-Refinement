@@ -1,0 +1,10 @@
+1. REgistro FGR (configurações atuais) até agora no dataset Arch:
+Pares: 
+1->0 OK  
+2->1 falhou
+3->2 OK
+4->3 Falhou 
+4->0 Falhou
+
+O problema no FGR não é a quantidade de tuple tests, pois memso utilizando
+20% dos pontos das nuvens ainda falhou.
