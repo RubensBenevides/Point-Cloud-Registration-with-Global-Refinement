@@ -1,13 +1,14 @@
 import open3d as o3d
-import minhas_funcoes as myf
 import numpy as np
 import time
 from matplotlib import pyplot as plt
 import seaborn as sns
 import pandas as pd
 
-# SCRIPT FOR COARSE PAIRWISE REGISTRATION USING FAST GLOBAL REGISTRATION
-# DATASET: NCLT
+
+# SCRIPT TO DO COARSE PAIRWISE REGISTRATION USING FAST GLOBAL REGISTRATION
+# ON NCLT DATASET
+
 
 def subtract_squared_poses(list_poses_1, list_poses_2):
     # Check length
