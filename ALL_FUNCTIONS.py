@@ -6,19 +6,23 @@ import quaternion as quat
 import matplotlib.pyplot as plt
 import pandas as pd
 import seaborn as sns
+import os
 
 
+# Load and clouds, pre-process and paint
+# Path pasta onde estao as nuvens, only clouds there!
 def carregar_nuvens_e_pre_processar(voxel_size,knn,std,paths):
-    nuvens_processadas = []
-    for i in range(int(len(paths))):
-        nuvem = o3d.io.read_point_cloud(paths[i])
-        nuvem_amostrada = nuvem.voxel_down_sample(voxel_size=voxel_size)
-        nuvem_filtrada, _ = nuvem_amostrada.remove_statistical_outlier(nb_neighbors=knn,std_ratio=std)
-        cor = np.random.rand(3)
-        nuvem_filtrada.paint_uniform_color(cor**2)
-        print(f"{nuvem} Amostrada e filtrada: {nuvem_filtrada}")
-        nuvens_processadas.append(nuvem_filtrada)
-    return nuvens_processadas
+    lista_nuvens = []
+    with os.scandir(path) as entries:
+        for entry in entries:
+            caminho = path + "/" + entry.name
+            nuvem = o3d.io.read_point_cloud(caminho)
+            nuvem_amostrada = nuvem.voxel_down_sample(voxel_size=voxel_size)
+            nuvem_filtrada, _ = nuvem_amostrada.remove_statistical_outlier(nb_neighbors=knn,std_ratio=std)
+            cor = np.random.vonmises(0, 1, size=(1,3) )
+            nuvem_filtrada.paint_uniform_color(cor)
+            lista_nuvens.append(nuvem)
+    return lista_nuvens
 
 
 # Function that, given n absolute poses, applies them to each cloud n in the list of n clouds
@@ -174,7 +178,7 @@ def planificar_nuvens_em_xy(lista_nuvens):
 def registro_FGR(source, target, voxel_size):
     n_pontos = int((len(source.points) + len(target.points))/2)
     # Estimate normals
-    kd_tree_normais = o3d.geometry.KDTreeSearchParamHybrid(radius=2.0*voxel_size, max_nn=20)
+    kd_tree_normais = o3d.geometry.KDTreeSearchParamHybrid(radius=2*voxel_size, max_nn=20)
     source.estimate_normals(kd_tree_normais)
     target.estimate_normals(kd_tree_normais)
     # Calculate FPFH features
@@ -183,13 +187,13 @@ def registro_FGR(source, target, voxel_size):
     target_fpfh = o3d.pipelines.registration.compute_fpfh_feature(target,kd_tree_descritores)
     # Define FGR parameters
     FGR_coarse = o3d.pipelines.registration.FastGlobalRegistrationOption(
-        division_factor = 1.2,       # padrao: 1.4
+        division_factor = 1.4,       # padrao: 1.4
         use_absolute_scale = True,   # padrao: False
         decrease_mu = True,          # padrao: False
         maximum_correspondence_distance = 2*voxel_size, # used to end the decrease_mu
         iteration_number = 300,      # padrao: 64
-        tuple_scale      = 0.97,     # padrao: 0.95
-        maximum_tuple_count = n_pontos) # padrao: 1000
+        tuple_scale      = 0.95,     # padrao: 0.95
+        maximum_tuple_count = int(n_pontos*0.2)) # padrao: 1000
     # Apply FGR
     result_FGR = o3d.pipelines.registration.registration_fgr_based_on_feature_matching(source,
                                                                                        target,
@@ -205,10 +209,12 @@ def registro_FGR(source, target, voxel_size):
 # OUTPUT: Open3D object containing RMSE between correspondences, fitness (sobreposition),
 # a list of correspondences and the 4x4 homogeneous transformation. 
 def GICP_robusto(source, target, max_corres_dist, initial_T, iterations):
-    # Constroi kd-trees e calcula normais das nuvens
+    # Constroi kd-trees e calcula normais e covariancias das nuvens
     kd_tree_normais = o3d.geometry.KDTreeSearchParamRadius(radius = 0.20)
     source.estimate_normals(kd_tree_normais)
     target.estimate_normals(kd_tree_normais)
+    source.estimate_covariances()
+    target.estimate_covariances()
     print(f"Applying robust GICP")
     loss = o3d.pipelines.registration.GMLoss(k = 1.0) # standard deviation of the noise
     result_ICP = o3d.pipelines.registration.registration_icp(
@@ -221,158 +227,171 @@ def GICP_robusto(source, target, max_corres_dist, initial_T, iterations):
     return result_ICP
 
 
-# ----------------------------- MULTISCALE GICP -----------------------------
-# This function applies GICP at n scales with a decreasing number of iterations per scale. 
-# The voxels that define the scales are created linearly in the interval [distance,0] 
-# without including 0. The iterations also divide the space [iterations,0] linearly in a 
-# number of intervals equal to the number of scales chosen.
-# INPUT: source, target = point cloud pair to be registered (open3d object).
-# n_scales = how many scales to use in GICP (integer).
-# distance = max correspondence distance, will be transformed in a descending list.
-# iteracoes_max = maximum iterations on the coarsest scale, will be transformed in a descending list.
-# inicial_T = inicial pose to initialize GICP (4x4 numpy matrix).
-# OUTPUT: Open3D object containing the registration result.
-def multiscale_GICP_variable_scales(source, target, n_escales, distance, iterations_max, inicial_T):
-    # List of scales (voxel sizes)
-    voxel_sizes = list(np.linspace(distance, distance/n_escales, n_escales))
-    # List of max_corresp_dist by scale 
-    max_correspondence_distances = list(np.linspace(distance, distance/n_escales, n_escales)*3)
-    # List of iterations by scale (more iterations on coarse scales)
-    iterations = list(np.linspace(iterations_max, iterations_max/n_escales, n_escales).astype(int))
-    # Parameter-free function to filter outliers
-    loss = o3d.pipelines.registration.L1Loss()
-    # Define the ICP type (GICP)
-    ICP_mode = o3d.pipelines.registration.TransformationEstimationForGeneralizedICP(loss)
-    # Aply the GICP on all scales
-    for i in range(n_escales):
-        # Downsample
-        source = source.voxel_down_sample(voxel_sizes[i])
-        target = target.voxel_down_sample(voxel_sizes[i])
-        # Estimate normals on the current scale
-        source.estimate_normals(o3d.geometry.KDTreeSearchParamHybrid(voxel_sizes[i]*2, max_nn=20))
-        target.estimate_normals(o3d.geometry.KDTreeSearchParamHybrid(voxel_sizes[i]*2, max_nn=20))
-        # Apply GICP on the current scale
-        result_icp = o3d.pipelines.registration.registration_generalized_icp(source,
-            target,
-            max_correspondence_distances[i],
-            inicial_T,
-            ICP_mode,
-            o3d.pipelines.registration.ICPConvergenceCriteria(relative_fitness=1e-6,
-                relative_rmse=1e-6,
-                max_iteration=iterations[i]))
-        inicial_T = result_icp.transformation
-    return result_icp
+# Multiscale generator using random sampling to simulate voxel_downsampling
+# INPUT: nuvem to be generated scales; n_escalas = number of scales to generate; 
+# voxel_inicial = voxel of the most sparce scale.
+# OUTPUT: list of clouds in coarse to fine, one by scale.
+# TODO Add this to the multi-scale fuction to acelerate multi-scale process
+def amostragem_multiescala_otimizada(nuvem, n_escalas, voxel_inicial):
+    nuvem_amostrada_inicial = nuvem.voxel_down_sample(voxel_inicial)
+    total_pts = len(np.asarray(nuvem.points))
+    pts_inici = len(np.asarray(nuvem_amostrada_inicial.points))
+    #escalas = np.asarray([voxel_inicial*2**i for i in range(n_escalas)]) # cresce quadrado
+    escalas = np.asarray([voxel_inicial+voxel_inicial*i for i in range(n_escalas)]) # cresce linear
+    # Predizer procentagens
+    a, b = 1.18397758, 5.09388767
+    porcentagens = a*np.exp(-b*escalas)
+    # Escalonar % em realacao a quantidade de pts. da nuvem amostrada por voxel_inicial
+    porcentagens_escalonadas = porcentagens*total_pts/pts_inici
+    porcentagens_normalizadas = porcentagens_escalonadas/np.linalg.norm(porcentagens_escalonadas)
+    porcentagens_normalizadas = porcentagens_normalizadas[1:10]
+    lista_nuvens_amostradas = []
+    for i in range(n_escalas-1):
+        nuvem_amostrada = nuvem_amostrada_inicial.random_down_sample(porcentagens_normalizadas[i])
+        lista_nuvens_amostradas.append(nuvem_amostrada)
+    lista_nuvens_amostradas.insert(0, nuvem_amostrada_inicial)
+    lista_nuvens_amostradas = list(reversed(lista_nuvens_amostradas))
+    return lista_nuvens_amostradas
 
 
-# Multiscale GICP with fixed number of scales
+# Function to create scales of downsampling voxels doubling them.
+# INPUT: integer number of desired scales.
+# OUTPUT: python list with the number of scales.
+def create_scales(n_scales):
+    voxel_radius = [0.1]
+    for i in range(n_scales-1):
+        voxel_radius.append(voxel_radius[-1]+voxel_radius[-1])
+    return voxel_radius
+
+
+# Multiscale GICP with variable number of scales
 # INPUT: source, target = pair of point clouds to be registered 
-# voxel_size = dawnsampling voxel to use (0.1 m recomended).
-# OUTPUT: registration_result =  Open3D object with correspondence set, RMSE, 
-# fitness and 4x4 transformation), information matrix = 6x6 matrix.
-def multiscale_GICP(source, target, voxel_size, initial_T):
-    voxel_radius = [8*voxel_size, 4*voxel_size, 2*voxel_size, voxel_size, 0.5*voxel_size]
-    max_correspondence_distance = [5*voxel_radius[0], 4*voxel_radius[1], 3*voxel_radius[2], 2.5*voxel_radius[3], 2*voxel_radius[4]] 
-    iteracoes = [500, 400, 300, 300, 300]
-    lista_knn_filtro = [50,40,30,20,10]
-    lista_std = [0.4, 0.8, 1.2, 1.6, 2.0]
-    lista_knn_normals = [4,8,12,16,20]
-    current_transformation = initial_T
+# n_scales = how much scales to use in the registration.
+# OUTPUT: registration_result = Open3D object with correspondence set, RMSE, 
+# fitness and a 4x4 transformation.
+def Multiscale_GICP(source, target, n_scales, itera_escala, T_ini):
+    # Create voxel sizes for downsampling
+    voxel_sizes = create_scales(n_scales)
+    voxel_sizes.reverse()
+    # Calculate max_correspondences_distances using radios form point cloud pair
+    max_correspondence_distance = radius_from_cloud_pair(source, target)
+    max_correspondence_distances = [max_correspondence_distance*(2**(-i)) for i in range(n_scales)] 
+    # Initialize M-GICP parameters
+    knn_filtro = 30
+    std_filtro = 1.0
+    current_transformation = T_ini
+    # Pesagem das correspondencias 
     loss = o3d.pipelines.registration.L1Loss()
-    for i in range(5):
+    # loop das escalas
+    for i in range(n_scales):
+        # Downsample
+        print(f"Escala: {i+1}")
+        source_temp = copy.deepcopy(source)
+        target_temp = copy.deepcopy(target)
         # Amostragem
-        source = source.voxel_down_sample(voxel_radius[i])
-        target = target.voxel_down_sample(voxel_radius[i])
-        # Filtragem
-        source, _ = source.remove_statistical_outlier(lista_knn_filtro[i], lista_std[i])
-        target, _ = target.remove_statistical_outlier(lista_knn_filtro[i], lista_std[i])
-        # Normals
-        source.estimate_normals(o3d.geometry.KDTreeSearchParamHybrid(voxel_radius[i]*2, lista_knn_normals[i]))
-        target.estimate_normals(o3d.geometry.KDTreeSearchParamHybrid(voxel_radius[i]*2, lista_knn_normals[i]))
-        result_icp = o3d.pipelines.registration.registration_generalized_icp(source,
-            target,
-            max_correspondence_distance[i],
+        print(f"Amostrando...")
+        source_down = source_temp.voxel_down_sample(voxel_sizes[i])
+        target_down = target_temp.voxel_down_sample(voxel_sizes[i])
+        # Filtrar outliers
+        print(f"Filtrando outliers...")
+        source_clean, _ = source_down.remove_statistical_outlier(knn_filtro, std_filtro)
+        target_clean, _ = target_down.remove_statistical_outlier(knn_filtro, std_filtro)
+        # Estimar normais
+        print(f"Estimando normais...")
+        source_clean.estimate_normals(o3d.geometry.KDTreeSearchParamKNN(knn=20))
+        target_clean.estimate_normals(o3d.geometry.KDTreeSearchParamKNN(knn=20))
+        # Aplicar GICP
+        result_icp = o3d.pipelines.registration.registration_generalized_icp(source_clean,
+            target_clean,
+            max_correspondence_distances[i],
             current_transformation,
             o3d.pipelines.registration.TransformationEstimationForGeneralizedICP(loss),
             o3d.pipelines.registration.ICPConvergenceCriteria(relative_fitness=1e-6,
-                relative_rmse=1e-6,
-                max_iteration=iteracoes[i]))
+                                                              relative_rmse=1e-6,
+                                                              max_iteration=itera_escala))
         current_transformation = result_icp.transformation
-    # Obter matriz de informacao (matriz N do ajustamento)
-    information_matrix_ICP_FGR = o3d.pipelines.registration.get_information_matrix_from_point_clouds(source,
-                                                                                                    target,
-                                                                                                    max_correspondence_distance[i],
-                                                                                                    current_transformation)
-    return result_icp, information_matrix_ICP_FGR
+    return result_icp
 
 
-# Multiscale point-to-plane ICP using tensors (all variables must by tensor type)
-def registrar_com_ICP_multiescala_ponto_plano(source, target, inicial_T, distancia):
-    # Lista de escalas de amostragem
-    voxel_sizes = o3d.utility.DoubleVector([8*distancia, 4*distancia, 2*distancia, distancia, distancia/2])
-    # Lista de criterios de convergencia (RMSE, Fitness, Iteracoes) para cada escala:
-    criteria_list = [o3d.t.pipelines.registration.ICPConvergenceCriteria(1e-6, 1e-6, 200),
-                     o3d.t.pipelines.registration.ICPConvergenceCriteria(1e-6, 1e-6, 200),
-                     o3d.t.pipelines.registration.ICPConvergenceCriteria(1e-6, 1e-6, 200),
-                     o3d.t.pipelines.registration.ICPConvergenceCriteria(1e-6, 1e-6, 200),
-                     o3d.t.pipelines.registration.ICPConvergenceCriteria(1e-6, 1e-6, 200)]
-    # Distancia maxima de busca de corespondencias em cada escala (o3d.utility.DoubleVector):
-    max_correspondence_distances = o3d.utility.DoubleVector([5*voxel_sizes[0], 4*voxel_sizes[1], 3*voxel_sizes[2], 2*voxel_sizes[3], 2*voxel_sizes[4]])
-    # Selecionar filtragem (Robust Kernel) para remocao de outliers e metodo de estimacao
-    estimation = o3d.t.pipelines.registration.TransformationEstimationPointToPlane()
-    # Salvar fitness e RMSE de cada iteracao para analisar resultado e tunar.
-    save_loss_log = True
-    # Estimar normais nas nuvens com a escala inicial
-    source.estimate_normals(max_nn=20, radius=distancia*2.5)
-    target.estimate_normals(max_nn=20, radius=distancia*2.5)
-    # Aplicar ICP-Generalizado em multiescala
-    registration_ms_icp = o3d.t.pipelines.registration.multi_scale_icp(source,
-        target,
-        voxel_sizes,
-        criteria_list,
-        max_correspondence_distances,
-        inicial_T,
-        estimation,
-        save_loss_log)
-    information_matrix = o3d.t.pipelines.registration.get_information_matrix(source, target, distancia, registration_ms_icp.transformation)
-    return registration_ms_icp, information_matrix
+# Do a coarse-to-fine registration using FGR and Multiscale GICP. 
+def Coarse_to_fine_FGR_M_GICP(source, target, voxel_size):
+    # FGR coarse registration
+    result_FGR = registro_FGR(source, target, voxel_size)
+    # Define M-GICP parameters
+    n_scales = 3
+    itera_escala = 100
+    T_ini = result_FGR.transformation
+    # Refine 
+    result_M_GICP = Multiscale_GICP(source, target, n_scales, itera_escala, T_ini)
+    # Get information matrix
+    information_matrix = o3d.pipelines.registration.get_information_matrix_from_point_clouds(
+        source,
+        target, 
+        voxel_size, 
+        result_M_GICP.transformation)
+    return result_M_GICP, information_matrix 
 
 
-# REGISTRO FGR + ICP-RGB em MULTIESCALA
-# INPUT: source, target = pair of point clouds to be registered 
-# voxel_size = dawnsampling voxel to use (0.1 m recomended).
-# OUTPUT: registration_result = (correspondence set, RMSE, fitness, transformation) 
-# and information matrix.
-def FGR_ICP_RGB_multiescala(source, target, voxel_size):
-    print("Aplicando FGR...")
-    source = source.voxel_down_sample(voxel_size)
-    target = target.voxel_down_sample(voxel_size)
-    resultado_FGR = registro_FGR(source, target, voxel_size)
-    print("Aplicando ICP-RGB em Multiescala...")
-    voxel_radius = [voxel_size*3, voxel_size*1.5, voxel_size*0.75]
-    iteracoes = [100, 50, 25]
-    current_transformation = resultado_FGR.transformation
-    for i in range(3):
-        # Amostrar e calcular normais
-        source_down = source.voxel_down_sample(voxel_radius[i])
-        target_down = target.voxel_down_sample(voxel_radius[i])
-        source_down.estimate_normals(o3d.geometry.KDTreeSearchParamHybrid(radius=voxel_radius[i]*2.5, max_nn=20))
-        target_down.estimate_normals(o3d.geometry.KDTreeSearchParamHybrid(radius=voxel_radius[i]*2.5, max_nn=20))
-        # Aplicar ICP
-        result_icp = o3d.pipelines.registration.registration_colored_icp(source_down,
-            target_down,
-            voxel_radius[i],
-            current_transformation,
-            o3d.pipelines.registration.TransformationEstimationForColoredICP(),
-            o3d.pipelines.registration.ICPConvergenceCriteria(relative_fitness=1e-6,
-                relative_rmse=1e-6,
-                max_iteration=iteracoes[i]))
-        current_transformation = result_icp.transformation
-    # Information matrix (called N matrix in the adjustment theory)
-    information_matrix_ICP_FGR = o3d.pipelines.registration.get_information_matrix_from_point_clouds(source,
-                                                                                                     target,
-                                                                                                     voxel_radius[i],
-                                                                                                     current_transformation)
-    return result_icp, information_matrix_ICP_FGR
+# Function that builds the pose-graph of clouds with pairwise registration. The value of k 
+# is the number of registrtions that will be made with one cloud, if k=3, then each cloud is 
+# registered in the next 3 clouds. Given n vertices (clouds) this will define a graph with 
+# k(2n-k-1)/2 edges (relative pairwise transformations).
+# INPUT: lista_nuvens = list of clouds; voxel_size = voxel used to downsample clouds in the list
+# k = degree of connectivity; if k = n, then it will build a complete graph.
+# OUTPUT: posegraph, a .json archive to be read with Open3D fuction "read_pose_graph".
+def full_registration(lista_nuvens, voxel_size, k):
+    print(f"\nPara n={len(lista_nuvens)} | k={k} serao feitos {k*(len(lista_nuvens)-k)+(k**2-k)/2} registros em pares\n")
+    ok = 0
+    pose_graph = o3d.pipelines.registration.PoseGraph()
+    odometry = np.identity(4)
+    pose_graph.nodes.append(o3d.pipelines.registration.PoseGraphNode(odometry))
+    n_pcds = len(lista_nuvens)
+    for source_id in range(n_pcds):
+        for target_id in range(source_id+1, n_pcds):
+            if (target_id == source_id+1):
+                print("Odometric case:")
+                print(f"Registering cloud {source_id} in cloud {target_id}")
+                T_FGR_ICP, information_matrix = Coarse_to_fine_FGR_M_GICP(lista_nuvens[source_id],
+                    lista_nuvens[target_id],
+                    voxel_size)
+                odometry = np.dot(T_FGR_ICP.transformation, odometry)
+                # Salva no vertice do grafo a multiplicação anterior invertida, isto eh, 
+                # salva a pose absoluta. Poses absolutas registram a nuvem n na nuvem 0.
+                pose_graph.nodes.append(o3d.pipelines.registration.PoseGraphNode(np.linalg.inv(odometry)))
+                # Cria a primeira aresta do grafo, onde eh salvo os id dos vertices 0->1, a transformacao,
+                # a matriz de informacao, e o tipo de aresta: odometria ou de loopclosure.
+                # Nas arestas estao as poses relativas, que registram a nuvem anterior na seguinte                    
+                pose_graph.edges.append(o3d.pipelines.registration.PoseGraphEdge(source_id,
+                                                                                target_id,
+                                                                                T_FGR_ICP.transformation,
+                                                                                information_matrix,
+                                                                                uncertain=False)) # False significa que a pose adveio do registro com a nuvem imediatamente posterior
+                if T_FGR_ICP.fitness > 0.40:
+                    print("Sucesso\n")
+                    ok = ok+1
+                else:
+                    print("Falhou\n")
+            elif (target_id != source_id+1) and (target_id-source_id <= k):
+                print("Caso loopclosure:")
+                print(f"Registro da nuvem {source_id} na nuvem {target_id}")
+                T_FGR_ICP, information_matrix = Coarse_to_fine_FGR_M_GICP(lista_nuvens[source_id],
+                    lista_nuvens[target_id],
+                    voxel_size)
+                pose_graph.edges.append(o3d.pipelines.registration.PoseGraphEdge(source_id,
+                                                                                target_id,
+                                                                                T_FGR_ICP.transformation,
+                                                                                information_matrix,
+                                                                                uncertain=True))
+                if T_FGR_ICP.fitness > 0.40:
+                    print("Sucesso\n")
+                    ok = ok+1
+                else:
+                    print("Falhou\n")
+                # uncertain = True significa que a nuvem nao foi registrada na imediatamente posterior (caso loop closure)
+            elif (target_id != source_id+1) and (target_id-source_id > k):
+                continue
+    print(f"{ok} sucessos de {k*(len(lista_nuvens)-k)+(k**2-k)/2} registros em pares. Taxa: {ok/(k*(len(lista_nuvens)-k)+(k**2-k)/2)}")
+    return pose_graph
 
 
 def cortar_nuvem_manual():
@@ -473,8 +492,9 @@ def Calcular_Erro_LoopClosure(T_circuito):
     ErroNoLoop = np.linalg.norm(LoopClosure_Rotacao-np.identity(3),'fro')
     # Montar POSE LOOP CLOSURE
     Pose_LoopClosure = np.hstack((LoopClosure_Rotacao,np.transpose([LoopClosure_Translacao])))
-    print(f"POSE Loop Closure:\n{Pose_LoopClosure}") 
-    print(f"Distancia (Frobenious) da matriz LoopClosure para a identidade:\n{ErroNoLoop}")
+    print(f"POSE Closure error:\n{Pose_LoopClosure}") 
+    print(f"Distancia (Frobenious) para a identidade:\n{ErroNoLoop}")
+    return Pose_LoopClosure
 
 
 # Function to compose relative poses to absolute poses
@@ -502,7 +522,9 @@ def poses_relativas_para_absolutas(T_circuito):
         rot_trans = np.hstack((lista_rotacoes_origem[i],np.transpose([lista_translacoes_origem[i]])))
         Pose = np.vstack((rot_trans,np.array([0,0,0,1])))
         Lista_de_Poses.append(Pose)
+    # Insert identity pose:
     Lista_de_Poses.insert(0,np.identity(4))
+    # delete pose closure error
     del Lista_de_Poses[-1]
     return Lista_de_Poses
 
@@ -563,11 +585,8 @@ def reconstruir_Ts_para_origem_SLERP(T_circuito):
         Matriz_R = quat.as_rotation_matrix(lista_quat_ajustado[i]) # Quaternios -> Matriz
         Pose = np.vstack((np.hstack((Matriz_R, np.transpose([lista_translacoes_origem[i]]))), aux_0001))
         Poses_SLERP.append(Pose)
-    # Pose LoopClosure:
-    Translacao_LoopClosure = np.transpose([lista_translacoes_origem[len(T_circuito)-1]])
-    Matriz_R_LoopClosure = quat.as_rotation_matrix(quat_LoopClosure) # QuaternioLoop -> Matriz
-    Pose_LoopClosure = np.vstack((np.hstack((Matriz_R_LoopClosure, Translacao_LoopClosure)),aux_0001))
-    Poses_SLERP.append(Pose_LoopClosure)
+    # Insert identity pose:
+    Poses_SLERP.insert(0,np.identity(4))
     return Poses_SLERP
 
 
@@ -598,17 +617,15 @@ def reconstruir_Ts_para_origem_LUM(T_circuito,Pesos):
     U = np.transpose(A)@P@Lb             # Matriz U = A'Lb
     X = N@U                              # Matriz X de translacoes ajustadas para a origem
     V = -A@X+Lb                          # Residuo. O mesmo que sum(Lb) a soma das translacoes
-    print(f"Sigma_Posteriori (Vt*P*V)/GL do ajustamento LUM: {(np.transpose(V)@P@V)/3} GL = 3")
+    print(f"Sigma_Posterior = Vt*P*V of LUM = {(np.transpose(V)@P@V)/3} ")
     # Juntar (rotacao + translacao ajustada LUM) em T(4x4): 
     Poses_ajustadas_LUM = []
     aux_0001 = np.array([0,0,0,1])
     for i in range(len(T_circuito)-1):
         Pose = np.vstack((np.hstack((lista_rotacoes_origem[i], X[3*i:3*(i+1)])), aux_0001))
         Poses_ajustadas_LUM.append(Pose)
-    # Pose LoopClosure:
-    rotacao_translacao = np.hstack((lista_rotacoes_origem[len(T_circuito)-1], np.transpose([Translacao_LoopClosure])))
-    Pose_LoopClosure = np.vstack((rotacao_translacao, aux_0001))
-    Poses_ajustadas_LUM.append(Pose_LoopClosure)
+    # Insert identity pose:
+    Poses_ajustadas_LUM.insert(0,np.identity(4))
     return Poses_ajustadas_LUM
 
 
@@ -638,17 +655,15 @@ def reconstruir_Ts_para_origem_SLERP_LUM(T_circuito,Pesos):
     U = np.transpose(A)@P@Lb             # Matriz U = A'Lb
     X = N@U                              # Translacoes ajustadas para a origem
     V = -A@X+Lb                          # Residuo. O mesmo que sum(Lb) a soma das translacoes
-    print(f"Sigma_Posteriori (Vt*P*V)/GL do ajustamento LUM: {np.transpose(V)@P@V/3} GL = 3")
+    print(f"Sigma_Posterior = Vt*P*V of LUM = {np.transpose(V)@P@V/3} GL = 3")
     # Juntar (rotacao slerpada + translacao ajustada LUM) em uma pose T(4x4): 
     Lista_Poses_Ajustadas_SLERP_LUM = []
     aux_0001 = np.array([0,0,0,1])
     for i in range(len(T_circuito)-1):
         Pose = np.vstack(( np.hstack((lista_R_origem[i], X[i*3:3*(i+1)])), aux_0001)) 
         Lista_Poses_Ajustadas_SLERP_LUM.append(Pose)
-    # Pose LoopClosure:
-    rot_trans = np.hstack((quat.as_rotation_matrix(quat_LoopClosure), np.transpose([Translacao_LoopClosure])))
-    Pose_LoopClosure = np.vstack((rot_trans, aux_0001))
-    Lista_Poses_Ajustadas_SLERP_LUM.append(Pose_LoopClosure)
+    # Insert identity pose:
+    Lista_Poses_Ajustadas_SLERP_LUM.insert(0,np.identity(4))
     return Lista_Poses_Ajustadas_SLERP_LUM
 
 
@@ -774,66 +789,15 @@ def Reconstrucao_animada_todas_de_uma_vez(Lista_nuvens,n_frames,frames_interpola
             Lista_nuvens[j].transform(frame_inverso)
 
 
-# Function that builds the pose-graph of clouds with pairwise registration. The value of k 
-# is the number of registrtions that will be made with one cloud, if k=3, then each cloud is 
-# registered in the next 3 clouds. Given n vertices (clouds) this will define a graph with 
-# k(2n-k-1)/2 edges (relative pairwise transformations).
-# INPUT: lista_nuvens = list of clouds; voxel_size = voxel used to downsample clouds in the list
-# k = degree of connectivity; if k = n, then it will build a complete graph.
-# OUTPUT: posegraph, a .json archive to be read with Open3D fuction "read_pose_graph".
-def full_registration(lista_nuvens, voxel_size, k):
-    print(f"\nPara n={len(lista_nuvens)} | k={k} serao feitos {k*(len(lista_nuvens)-k)+(k**2-k)/2} registros em pares\n")
-    ok = 0
-    pose_graph = o3d.pipelines.registration.PoseGraph()
-    odometry = np.identity(4)
-    pose_graph.nodes.append(o3d.pipelines.registration.PoseGraphNode(odometry))
-    n_pcds = len(lista_nuvens)
-    for source_id in range(n_pcds):
-        for target_id in range(source_id+1, n_pcds):
-            if (target_id == source_id+1):
-                print("Odometric case:")
-                print(f"Registering cloud {source_id} in cloud {target_id}")
-                T_FGR_ICP, information_matrix_ICP_FGR = FRG_ICP_colorido_plano_multiescala(lista_nuvens[source_id], lista_nuvens[target_id], voxel_size)
-                odometry = np.dot(T_FGR_ICP.transformation, odometry)
-                # Junta no ponto do grafo a multiplicação anterior invertida
-                pose_graph.nodes.append(o3d.pipelines.registration.PoseGraphNode(np.linalg.inv(odometry)))                    
-                pose_graph.edges.append(o3d.pipelines.registration.PoseGraphEdge(source_id,
-                                                                                target_id,
-                                                                                T_FGR_ICP.transformation,
-                                                                                information_matrix_ICP_FGR,
-                                                                                uncertain=False)) # False significa que a pose adveio do registro com a nuvem imediatamente posterior
-                if T_FGR_ICP.fitness > 0.40:
-                    print("Sucesso\n")
-                    ok = ok+1
-                else:
-                    print("Falhou\n")
-            elif (target_id != source_id+1) and (target_id-source_id <= k):
-                print("Caso loopclosure:")
-                print(f"Registro da nuvem {source_id} na nuvem {target_id}")
-                T_FGR_ICP, information_matrix_ICP_FGR = FRG_ICP_colorido_plano_multiescala(lista_nuvens[source_id], lista_nuvens[target_id], voxel_size)
-                pose_graph.edges.append(o3d.pipelines.registration.PoseGraphEdge(source_id,
-                                                                                target_id,
-                                                                                T_FGR_ICP.transformation,
-                                                                                information_matrix_ICP_FGR,
-                                                                                uncertain=True))
-                if T_FGR_ICP.fitness > 0.40:
-                    print("Sucesso\n")
-                    ok = ok+1
-                else:
-                    print("Falhou\n")
-                # uncertain = True significa que a nuvem nao foi registrada na imadiatamente posterior (caso loop closure)
-            elif (target_id != source_id+1) and (target_id-source_id > k):
-                continue
-    print(f"{ok} sucessos de {k*(len(lista_nuvens)-k)+(k**2-k)/2} registros em pares. Taxa: {ok/(k*(len(lista_nuvens)-k)+(k**2-k)/2)}")
-    return pose_graph
 
 
 
 # Function which calculates RMSE and Fitness given a list of poses, a list of clouds and a distance.
-# Input: 'lista_nuvens' = list of n clouds. 'T_circuito' = n-1 relative poses.
+# IMPUT: 'lista_nuvens' = list of n clouds. 'T_circuito' = n-1 relative poses of the circuit.
 # 'distancia' = maximum matching distance to consider when calculating the RMSE and fitness.
 # If the nº of poses is equal to nº of clouds the circuit is considered closed, that is, 
 # the last pose is considered to be the loop-closure pose (last->first).
+# OUTPUT: 2 python lists, one of RMSE and other of Fitness, to each pair in the circuit.
 def calculate_RMSE_and_fitness(lista_nuvens, T_circuito, distancia):
     n_nuvens = len(lista_nuvens)
     n_T = len(T_circuito)
@@ -871,29 +835,6 @@ def poses_absolutas_para_relativas(poses_absolutas):
     # Compor poses absolutas com absolutas invertidas, mas com 1 de defasagem entre elas
     relativas = [compor_duas_poses(poses_absolutas[i+1], absolutas_invertidas[i]) for i in range(n-1)]
     return relativas
-
-
-# Multiscale generator using random sampling to simulate voxel_downsampling
-# INPUT: nuvem to be generated scales; n_escalas = number of scales to generate; 
-# voxel_inicial = voxel of the most sparce scale.
-# OUTPUT: list of clouds in coarse to fine, one by scale. 
-def amostragem_multiescala_otimizada(nuvem, n_escalas, voxel_inicial):
-    nuvem_amostrada_inicial = nuvem.voxel_down_sample(voxel_size=voxel_inicial)
-    total_pts = len(np.asarray(nuvem.points))
-    pts_inici = len(np.asarray(nuvem_amostrada_inicial.points))
-    escalas = np.asarray([voxel_inicial*2**i for i in range(n_escalas)]) # metros
-    # Predizer procentagens
-    a,b,c = 1.6179,7.9955,0.3729
-    porcentagens = a*np.exp(-b*escalas**c)
-    # Escalonar % em realacao a quantidade de pts. da nuvem amostrada por voxel_inicial
-    porcentagens_escalonadas = porcentagens*total_pts/pts_inici
-    porcentagens_normalizadas = porcentagens_escalonadas/np.linalg.norm(porcentagens_escalonadas)
-    lista_nuvens_amostradas = []
-    for porcentagem in reversed(range(n_escalas-1)):
-        nuvem_amostrada = nuvem_amostrada_inicial.random_down_sample(porcentagens_normalizadas[porcentagem+1])
-        lista_nuvens_amostradas.append(nuvem_amostrada)
-    lista_nuvens_amostradas.append(nuvem_amostrada_inicial)
-    return lista_nuvens_amostradas
 
 
 # Function to plot RMSE vs ITERATIONS of ICP,
@@ -988,9 +929,12 @@ def plot_bar_time(time_list):
     plt.show()
 
 
-def plotar_lista(lista):
-    fig, axes = plt.subplots(nrows=1, ncols=1, figsize=(20, 5))
-    axes.set_title("Inlier RMSE vs Iteration"), axes.plot([i for i in range(len(lista))], lista)
+def plot_MSE_of_dataset(MSE_1, MSE_2, MSE_3, MSE_4, error_type):
+    MSE_data = [MSE_1, MSE_2, MSE_3, MSE_4]
+    error_type = [error_type, error_type, error_type, error_type]
+    optimization = ["Original","LUM","SLERP","SLERP+LUM"]
+    d = {'MSE (all poses)': MSE_data, 'Error': error_type, 'Optimization': optimization}
+    sns.barplot(data = pd.DataFrame(d), x='Error', y='MSE (all poses)', hue='Optimization')
     plt.show()
 
 
@@ -1020,7 +964,7 @@ def rand_rotation_matrix(deflection=1.0):
 # of distances: euclidean distances for pairs of translations; 
 # Frobenious distances for pairs of rotations.
 # INPUT: 2 lists with n poses each. OUTPUT: 2 lists of n distances (rot + trans).   
-def subtract_poses(list_poses_1, list_poses_2):
+def subtract_squared_poses(list_poses_1, list_poses_2):
     # Check length
     if len(list_poses_1) != len(list_poses_2):
         raise Exception("The list of poses should be the same size")
@@ -1071,3 +1015,134 @@ def plot_antes_depois_rotacoes(diff_R_1, diff_R_2):
     plt.grid(True)
     plt.legend()
     plt.show()
+
+
+def colorir_voxels(pc0):
+    # fit to unit cube
+    pc0.scale(1 / np.max(pc0.get_max_bound() - pc0.get_min_bound()), center=pc0.get_center())
+    # colorir
+    cor = np.random.vonmises(0, 1, size=( len(pc0.points), 3))
+    pc0.colors = o3d.utility.Vector3dVector(cor)
+    # Make voxels
+    voxel_grid = o3d.geometry.VoxelGrid.create_from_point_cloud(pc0, voxel_size=0.1)
+    o3d.visualization.draw_geometries([voxel_grid])
+    o3d.visualization.draw([pc0])
+
+
+# Extrac eigen value-based features of a point cloud (pc)
+def extract_eigen_features(pc):
+    # Centralizar
+    centroid = pc.get_center()
+    pc = np.asarray(pc.points) - centroid
+    # Normalizar
+    pc = pc / max(np.linalg.norm(np.amax(pc,0)), np.linalg.norm(np.amin(pc,0)))
+    # Transformar de volta em PointCloud object
+    pc_o3d = o3d.geometry.PointCloud()
+    pc_o3d.points = o3d.utility.Vector3dVector(pc)
+    # Calcular Matriz de Correlacao
+    _, C = o3d.geometry.PointCloud.compute_mean_and_covariance(pc_o3d)
+    # Decompor em autovalores e autovetores
+    _,s,_ = np.linalg.svd(C)
+    # Calcular eigen features
+    # Calculo do somatorio eh feito antes, ele escapa do intervalo [0,1] se feito apos a normalizacao
+    eig_sum = s[0]+s[1]+s[2]
+    # Normalizar autovalores
+    s = s/np.linalg.norm(s)
+    lin = (s[0] - s[1]) / s[0]
+    pla = (s[1] - s[2]) / s[0]
+    esf = s[2] / s[0]
+    cur = s[2] / (s[0]+s[1]+s[2])
+    ani = s[0] - s[2] / s[0]
+    omn = (s[0] * s[1] * s[2])**(1/3)
+    eigen_vector = np.array([lin, pla, esf, cur, ani, omn, eig_sum])
+    return eigen_vector
+
+
+# Function to draw n correspondences between a pair of registered point clouds
+def draw_correspondences(source, target, registration_result, n):
+    # Select correspondence set
+    point_pairs = np.asarray(registration_result.correspondence_set)
+    # Select n random correspondences
+    random = np.random.randint( len( np.asarray(registration_result.correspondence_set) ), size=n )
+    random_point_pairs = point_pairs[random, :]
+    # Make lines between correspondences
+    line_set = o3d.geometry.LineSet.create_from_point_cloud_correspondences(source, target, random_point_pairs)
+    # Draw line set with clouds
+    o3d.visualization.draw_geometries([source, target, line_set])
+
+
+# Function to analyse knn distances of points inside a single cloud.
+# Useful for density analyses.
+def plot_cloud_knn_distances(pc1,pc2):
+    dists_1 = pc1.compute_nearest_neighbor_distance()
+    dists_2 = pc2.compute_nearest_neighbor_distance()
+    # Transformar distancias calculadas em data frames para visualizar estatisticas 
+    rotulos_1 = ['Voxel downsampling' for i in range(len(dists_1))]
+    Distancias_1 = pd.DataFrame({'Knn distances': dists_1, 'class': rotulos_1})
+    rotulos_2 = ['Hybrid downsampling' for i in range(len(dists_2))]
+    Distancias_2 = pd.DataFrame({'Knn distances': dists_2, 'class': rotulos_2})    
+    df = pd.concat([Distancias_1,Distancias_2], axis=0)
+    print("Boxplot of knn distances from borh clouds")
+    sns.boxplot(data=df, x="Knn distances", y="class")
+    plt.show()
+
+
+# Fuction to claculate mean radius from a pair of point clouds.
+# OUTPUT: float number. INPUT: pair of point clouds. 
+def radius_from_cloud_pair(source, target):
+    xyz_max = source.get_max_bound()
+    xyz_min = source.get_min_bound()
+    dif_1 = xyz_max - xyz_min
+    xyz_max = target.get_max_bound()
+    xyz_min = target.get_min_bound()
+    dif_2 = xyz_max - xyz_min
+    rad_1 = (dif_1[0]*dif_1[1]*dif_1[2])**(1/3)
+    rad_2 = (dif_2[0]*dif_2[1]*dif_2[2])**(1/3)
+    return (rad_1+rad_2)/2
+
+
+# Function to rotate a cloud by 1 degree around Z axis and animate.
+def rotate_cloud(pcd):
+    R_z = np.array([[0.9993908, -0.0348995,  0.0000000],
+                    [0.0348995,  0.9993908,  0.0000000],
+                    [0.0000000,  0.0000000,  1.0000000]])
+    vis = o3d.visualization.Visualizer()
+    vis.create_window()
+    vis.add_geometry(pcd)
+    opt = vis.get_render_option()
+    opt.background_color = np.asarray([0, 0, 0])
+    for i in range(3600):
+        pcd.rotate(R_z)
+        vis.update_geometry(pcd)
+        vis.poll_events()
+        vis.update_renderer()   
+    vis.run()
+    vis.destroy_window()
+
+
+# Funcao que reorna a trajetoria das poses.
+# ENTRADA: poses absolutas (python list).
+# SAIDA: Conjunto de linhas (objeto da Open3D).
+def criar_trejetoria_com_linhas(poses):
+    # Ler translacoes e rotacoes das poses e stackear tudo verticalmente
+    matriz_translacoes = np.zeros((1,3))
+    matriz_rotacoes = np.identity(3)
+    for i in range(len(poses)-1):
+        t = np.vstack((matriz_translacoes, np.transpose(np.transpose([poses[i][:3,3]]))))
+        R = np.vstack((matriz_rotacoes, poses[i][:3,:3]))
+        matriz_translacoes = t
+        matriz_rotacoes = R
+    # Inicializar lista das linhas e dos eixos:
+    linhas = []
+    for i in range(len(matriz_translacoes)):
+        # Definir pares de pontos que definem as linhas:
+        if i < len(matriz_translacoes)-1:
+            linha = [i,i+1]
+            linhas.append(linha)
+        elif i == len(matriz_translacoes)-1:
+            linha = [i,0]
+            linhas.append(linha)
+    # Criar conjunto de linhas, essa funcao retorna tudo numa so geometria
+    conjunto_linhas = o3d.geometry.LineSet(points=o3d.utility.Vector3dVector(matriz_translacoes),
+                                            lines=o3d.utility.Vector2iVector(linhas))
+    return conjunto_linhas
