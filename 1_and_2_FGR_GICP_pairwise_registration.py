@@ -2,248 +2,170 @@ import open3d as o3d
 import minhas_funcoes as myf
 import numpy as np
 import time
-import matplotlib as p
+from matplotlib import pyplot as plt
+import seaborn as sns
+import pandas as pd
+
+# SCRIPT FOR COARSE PAIRWISE REGISTRATION USING FAST GLOBAL REGISTRATION
+# DATASET: NCLT
+
+def subtract_squared_poses(list_poses_1, list_poses_2):
+    # Check length
+    if len(list_poses_1) != len(list_poses_2):
+        raise Exception("The list of poses should be the same size")
+    # Initialize lists
+    distances_R = []
+    distances_t = []
+    # Loop to subtract poses
+    for i in range(len(list_poses_1)):
+        d_poses = list_poses_1[i] - list_poses_2[i]
+        d_squared = d_poses**2
+        # We normalize rotation distance by 2*2**(1/2).
+        d_R = (sum(sum(d_squared[:3,:3]))**(1/2))/2*2**(1/2)
+        d_t = sum(d_squared[:3,3])**(1/2)
+        distances_R.append(d_R)
+        distances_t.append(d_t)
+    return distances_R, distances_t
 
 
-# One parameter to rule them all
-voxel_size = 0.1 # meters
+# Fast Global Registration (FGR) adapted to register a pair of TLS point clouds.
+# INPUT: (source,target) -> a pair of point cloud. (voxel_size) the voxels used
+# to downsample the original point cloud.
+# OUTPUT: Open3D object containing RMSE between correspondences, fitness (sobreposition),
+# list of correspondences and the 4x4 relative transformation. 
+def registro_FGR(source, target, voxel_size):
+    n_pontos = int((len(source.points) + len(target.points))/2)
+    # Estimate normals
+    kd_tree_normais = o3d.geometry.KDTreeSearchParamHybrid(radius=2*voxel_size, max_nn=20)
+    source.estimate_normals(kd_tree_normais)
+    target.estimate_normals(kd_tree_normais)
+    # Calculate FPFH features
+    kd_tree_descritores = o3d.geometry.KDTreeSearchParamHybrid(radius=10*voxel_size, max_nn=200)
+    source_fpfh = o3d.pipelines.registration.compute_fpfh_feature(source,kd_tree_descritores)
+    target_fpfh = o3d.pipelines.registration.compute_fpfh_feature(target,kd_tree_descritores)
+    # Define FGR parameters
+    FGR_coarse = o3d.pipelines.registration.FastGlobalRegistrationOption(
+        division_factor = 1.4,       # padrao: 1.4
+        use_absolute_scale = False,   # padrao: False (False is better)
+        decrease_mu = True,          # padrao: False
+        maximum_correspondence_distance = 2*voxel_size, # used to end the decrease_mu
+        iteration_number = 300,      # padrao: 64
+        tuple_scale      = 0.95,     # padrao: 0.95
+        maximum_tuple_count = int(n_pontos*0.2)) # padrao: 1000
+    # Apply FGR
+    result_FGR = o3d.pipelines.registration.registration_fgr_based_on_feature_matching(source,
+                                                                                       target,
+                                                                                       source_fpfh,
+                                                                                       target_fpfh,
+                                                                                       FGR_coarse)
+    return result_FGR
 
 
-# Funcao que seleciona as variaveis necessarias para executar os resultados de um dataset. 
-# Nao reproduz o resultado, pois demoraria demais, apenas carrega o resultado salvo.
-def switch(dataset):
-    if dataset == "1":
-        dataset = "Facade"
-        print("You'll see Facade results: RMSE and Fitness from 7 pairwise registrations.")
-        path = "nuvens/nuvens_pre_processadas/Facade/"
-        n_nuvens = 7
-        paths = [path + f"s{i}.pcd" for i in range(n_nuvens)]
-        return n_nuvens, paths, dataset
-    elif dataset == "2":
-        dataset = "Courtyard"
-        print("You'll see Courtyard results: RMSE and Fitness from 8 pairwise registrations.")
-        path = "nuvens/nuvens_pre_processadas/Courtyard/"
-        n_nuvens = 8
-        paths = [path + f"s{i}.pcd" for i in range(n_nuvens)]
-        return n_nuvens, paths, dataset
-    elif dataset == "3":
-        dataset = "Arch"
-        print("You'll see Arch results: RMSE and Fitness from 5 pairwise registrations.")
-        path = "nuvens/nuvens_pre_processadas/Arch/"
-        n_nuvens = 5
-        paths = [path + f"s{i}.pcd" for i in range(n_nuvens)]
-        return n_nuvens, paths, dataset
-    elif dataset == "4":
-        dataset = "Bremen"
-        print("You'll see Bremen results: RMSE and Fitness from 13 pairwise registrations.")
-        path = "nuvens/nuvens_pre_processadas/Bremen/"
-        n_nuvens = 13
-        paths = [path + f"s{i}.pcd" for i in range(n_nuvens)]
-        return n_nuvens, paths, dataset
-    elif dataset == "5":
-        dataset = "NCLT"
-        print("You'll see NCLT results: RMSE and Fitness from 901 pairwise registrations.")
-        path = "nuvens/nuvens_pre_processadas/NCLT/"
-        n_nuvens = 901
-        paths = [path + f"s{i}.pcd" for i in range(n_nuvens)]
-        return n_nuvens, paths, dataset
-    elif dataset == "6":
-        dataset = "Office"
-        print("You'll see Office results: RMSE and Fitness from 5 pairwise registrations.")
-        path = "nuvens/nuvens_pre_processadas/Office/"
-        n_nuvens = 5
-        paths = [path + f"s{i}.pcd" for i in range(n_nuvens)]
-        return n_nuvens, paths, dataset
+# Function that, given n absolute poses, applies them to each cloud n in the list of n clouds
+# The first pose on the list should be the identity. 
+# The first cloud in the list will be the global origin. 
+# INPUT: lista_poses = list of absolute poses; lista_nuvens = list of clouds.
+# OUTPUT: Open the open3d window and draw results. 
+def apply_poses_in_clouds(lista_poses,lista_nuvens):
+    if len(lista_nuvens) != len(lista_nuvens):
+        raise ValueError("Quantidade de poses absolutas deve ser igual a quantidade de nuvens")
+    n_poses = len(lista_poses)
+    # criar copias para manter nuvens originais no lugar
+    copias = copy.deepcopy(lista_nuvens)
+    # Desenhar nuvens transformadas com FoV = 0 graus
+    vis = o3d.visualization.Visualizer()
+    vis.create_window(width = 1920, height = 1080)
+    ctr = vis.get_view_control()
+    ctr.change_field_of_view(step=0.0)
+    # Aplicar poses nas copias, perceba que 
+    for i in range(n_poses):
+        copias[i].transform(lista_poses[i])
+        vis.add_geometry(copias[i])
+    vis.run()
+    vis.destroy_window()
 
 
-# Define the dataset variables
-dataset = input("Select the dataset:\n 1 = Facade\n 2 = Courtyard\n 3 = Arch\n 4 = Bremen\n 5 = NCLT (MLS)\n 6 = Office\n")
-print("Do you want to reproduce the results or just load them?")
-decision = input("Digit 1 to show/load results or 0 to reproduce them: ")
+# Function to compose relative poses to absolute poses
+# INPUT: T_circuito = list of relative poses: T10, T21, T32, ... Tn_n-1
+# OUTPUT: List of absolute poses: T10, T20, T30, ... Tn_0
+def poses_relativas_para_absolutas(T_circuito):
+    # obter lista de rotacoes para a origem por composicao multiplicativa
+    lista_rotacoes_origem = []
+    for i in range(len(T_circuito)):
+        LoopClosure = np.identity(3)
+        for j in range (len(T_circuito)-i-1,-1,-1):        
+            LoopClosure = LoopClosure@T_circuito[j][:3,:3] # compoe j matrizes de rotacao
+        lista_rotacoes_origem.append(LoopClosure) # lista de rotacoes compostas para origem
+    lista_rotacoes_origem = list(reversed(lista_rotacoes_origem)) # inverte a lista, ultima eh a LoopClosure
+    # obter as translacoes para a origem (t20, t30, t40, etc.)
+    t_ini = T_circuito[0][0:3,3]
+    lista_translacoes_origem = [t_ini]
+    for i in range(len(T_circuito)-1):
+        t_posterior = lista_rotacoes_origem[i]@T_circuito[i+1][0:3,3] + t_ini
+        t_ini = t_posterior
+        lista_translacoes_origem.append(t_posterior)
+    # Juntar (rotacao + translacao) em T(4x4):
+    Lista_de_Poses = []
+    for i in range(len(T_circuito)):
+        rot_trans = np.hstack((lista_rotacoes_origem[i],np.transpose([lista_translacoes_origem[i]])))
+        Pose = np.vstack((rot_trans,np.array([0,0,0,1])))
+        Lista_de_Poses.append(Pose)
+    # Insert identity pose:
+    Lista_de_Poses.insert(0,np.identity(4))
+    # delete pose closure error
+    del Lista_de_Poses[-1]
+    return Lista_de_Poses
 
 
-# Load dataset variables
-n_nuvens, paths, dataset = switch(dataset)
+# LOAD DATASET CLOUDS
+n_clouds = 901
+clouds = [o3d.io.read_point_cloud(f"nuvens/nuvens_pre_processadas/NCLT/s{i}.pcd") for i in range(n_clouds)]
 
 
-# Load clouds
-nuvens = [o3d.io.read_point_cloud(paths[i]) for i in range(n_nuvens)]
+# FGR REGISTRATION LOOP FOR CIRCUIT PAIRS
+voxel_size = 0.1
+results_FGR = []
+times_FGR = []
+for i in range(n_clouds):
+    if i < n_clouds-1:
+        print(f"Registering cloud {i+1} in cloud {i}")
+        #ini = time.time()
+        result_FGR = registro_FGR(clouds[i+1], clouds[i], voxel_size)
+        #time_FGR = time.time()-ini
+        #print(f"Pair {i}->{i+1} time taken: {round(time_FGR,2)} sec")
+        #print(f"Pair {i}->{i+1} RMSE: {round(result_FGR.inlier_rmse,2)}")
+        #times_FGR.append(time_FGR)
+        results_FGR.append(result_FGR)
+    elif i == n_clouds-1:
+        print(f"Registering cloud {0} in cloud {i}")
+        result_FGR = registro_FGR(clouds[0], clouds[i], voxel_size)
+        results_FGR.append(result_FGR)
 
 
-# Print estimated time to reproduce results
-if decision == '0' and dataset == 'Courtyard':
-    print("Estimated time to reproduce Courtyard results: 2300 seconds.")
-elif decision == '0' and dataset == 'Facade':
-    print("Estimated time to reproduce Facade results: 400 seconds.")
-elif decision == '0' and dataset == 'Arch':
-    print("Estimated time to reproduce Arch results: 39772 seconds.")
-elif decision == '0' and dataset == 'Bremen':
-    print("Estimated time to reproduce Bremen results: 86000 seconds.")
-elif decision == '0' and dataset == 'NCLT':
-    print("Estimated time to reproduce NCLT results: 4800 seconds.")
-elif decision == '0' and dataset == 'Office':
-    print("Estimated time to reproduce Office results: 130 seconds.")
+# RECOVER ABSOLUTES POSES FROM RELATIVE POSES
+relative_poses_FGR = [results_FGR[i].transformation for i in range(n_clouds)]
+absolute_poses_FGR = poses_relativas_para_absolutas(relative_poses_FGR)
 
 
-if decision == '1' and (dataset == 'Facade' or dataset == 'Courtyard' or dataset == 'NCLT' or dataset == 'Office'):
-    # READ SAVED RESULTS (FGR)
-    relative_poses_FGR = [np.loadtxt(f"relative_poses_FGR/{dataset}/pose_{i+1}_{i}.txt") for i in range(n_nuvens-1)]
-    loopclosure = np.loadtxt(f"relative_poses_FGR/{dataset}/pose_0_{n_nuvens-1}.txt")
-    relative_poses_FGR.append(loopclosure)
-    # READ SAVED RESULTS (Multiscale-GICP)
-    relative_poses_FGR_GICP = [np.loadtxt(f"relative_poses_FGR_GICP/{dataset}/pose_{i+1}_{i}.txt") for i in range(n_nuvens-1)]
-    loopclosure = np.loadtxt(f"relative_poses_FGR_GICP/{dataset}/pose_0_{n_nuvens-1}.txt")
-    relative_poses_FGR_GICP.append(loopclosure)
-    # Calculate pairwise RMSE
-    RMSE_FGR, fitness_FGR = myf.calculate_RMSE_and_fitness(nuvens, relative_poses_FGR, voxel_size)
-    RMSE_FGR_GICP, fitness_FGR_GICP = myf.calculate_RMSE_and_fitness(nuvens, relative_poses_FGR_GICP, voxel_size)
-    # Calculate pairwise FITNESS
-    if dataset == 'NCLT':
-        myf.plot_RMSE_line(RMSE_FGR,RMSE_FGR_GICP)
-        myf.plot_fitness_line(fitness_FGR,fitness_FGR_GICP)
-    myf.plot_RMSE_BAR(RMSE_FGR,RMSE_FGR_GICP)
-    myf.plot_Fitness_BAR(fitness_FGR,fitness_FGR_GICP)
-    # Compose relative poses to obtain absolute poses
-    absolute_poses_FGR = myf.poses_relativas_para_absolutas(relative_poses_FGR)
-    absolute_poses_FGR_GICP = myf.poses_relativas_para_absolutas(relative_poses_FGR_GICP)
-    # Apply absolute poses to draw before and after (all pairs must be correctly registered) 
-    print("Showing 3D reconstruction with FGR only")
-    myf.apply_poses_in_clouds(absolute_poses_FGR, nuvens)
-    print("Showing 3D reconstruction with FGR+GICP")
-    myf.apply_poses_in_clouds(absolute_poses_FGR_GICP, nuvens)
-    # Print the enhancement in percetage of the RMSE and Fitness for all poses
-    print(f"Percentage of reduction in RMSE: {1-(np.mean(RMSE_FGR_GICP)/np.mean(RMSE_FGR))}")
-    print(f"Percentage of increase in sobreposition: {1-(np.mean(fitness_FGR)/np.mean(fitness_FGR_GICP))}")
-# FOR DATASETS BREMEN AND ARCH, LOAD MANUAL POSES
-elif decision == '1' and (dataset == 'Arch' or dataset == 'Bremen'):
-    print(f"\nFGR was not able to register pairs of clouds from {dataset}.\nLoading manual and manual-refined relative poses to compare.")
-    # READ PRE-SAVED RESULTS (FGR)
-    relative_poses_FGR = [np.loadtxt(f"relative_poses_FGR/{dataset}/manuais/pose_{i+1}_{i}.txt") for i in range(n_nuvens-1)]
-    loopclosure = np.loadtxt(f"relative_poses_FGR/{dataset}/manuais/pose_0_{n_nuvens-1}.txt")
-    relative_poses_FGR.append(loopclosure)
-    # READ PRE-SAVED RESULTS (Multiscale-GICP)
-    relative_poses_FGR_GICP = [np.loadtxt(f"relative_poses_FGR_GICP/{dataset}/manuais_refinadas/pose_{i+1}_{i}.txt") for i in range(n_nuvens-1)]
-    loopclosure = np.loadtxt(f"relative_poses_FGR_GICP/{dataset}/manuais_refinadas/pose_0_{n_nuvens-1}.txt")
-    relative_poses_FGR_GICP.append(loopclosure)
-    # CALCULATE PAIRWISE RMSE and FITNESS
-    RMSE_FGR, fitness_FGR = myf.calculate_RMSE_and_fitness(nuvens, relative_poses_FGR, voxel_size)
-    RMSE_FGR_GICP, fitness_FGR_GICP = myf.calculate_RMSE_and_fitness(nuvens, relative_poses_FGR_GICP, voxel_size)
-    # PLOT RMSE and FITNESS
-    myf.plot_RMSE_BAR(RMSE_FGR,RMSE_FGR_GICP)
-    myf.plot_Fitness_BAR(fitness_FGR,fitness_FGR_GICP)
-    # Compose relative poses to obtain absolute poses
-    absolute_poses_FGR = myf.poses_relativas_para_absolutas(relative_poses_FGR)
-    absolute_poses_FGR_GICP = myf.poses_relativas_para_absolutas(relative_poses_FGR_GICP)
-    # Apply absolute poses to draw before and after (all pairs must be correctly registered) 
-    print("Showing 3D reconstruction with FGR only")
-    myf.apply_poses_in_clouds(absolute_poses_FGR, nuvens)
-    print("Showing 3D reconstruction with FGR+M-GICP refinement")
-    myf.apply_poses_in_clouds(absolute_poses_FGR_GICP, nuvens)
-    # Print the enhancement in percetage of the RMSE and Fitness for all poses
-    print(f"Percentage of reduction in RMSE: {1-(np.mean(RMSE_FGR_GICP)/np.mean(RMSE_FGR))}")
-    print(f"Percentage of increase in sobreposition: {1-(np.mean(fitness_FGR)/np.mean(fitness_FGR_GICP))}")
+# DRAW RESULT
+apply_poses_in_clouds(absolute_poses_FGR, clouds)
 
 
-    
-# REGISTRATION LOOP - IF YOU CHOSE TO REPRODUCE RESULTS
-elif decision == '0': 
-    # PART 1 - FGR PAIRWISE REGISTRATION IN ALL PAIRS UNTIL THE CIRCUIT IS CLOSED
-    results_FGR = []
-    times_FGR = []
-    # FGR registration loop:
-    for i in range(n_nuvens):
-        if i < n_nuvens-1:
-            # Odometry case: 2 => 1, 3 => 2, n+1 => n
-            print(f"Registering cloud {i+1} in cloud {i} with FGR")
-            ini = time.time()
-            result_FGR = myf.registro_FGR(nuvens[i+1], nuvens[i], voxel_size)
-            time_FGR = time.time()-ini
-            print(f"Pair {i+1}->{i} time taken: {round(time_FGR)} sec")
-            print(f"Pair {i+1}->{i} fitness: {result_FGR.fitness}")
-            print(f"Pair {i+1}->{i} RMSE: {result_FGR.inlier_rmse}")
-            times_FGR.append(time_FGR)
-            results_FGR.append(result_FGR)
-            # Draw registration result
-            myf.desenhar_resultado_registro(nuvens[i+1], nuvens[i], result_FGR.transformation)
-        elif i == n_nuvens-1:
-            # Loop-closure case: first_cloud => last_cloud
-            print(f"Registering cloud 0 in cloud {i} with FGR")
-            ini = time.time()
-            result_FGR = myf.registro_FGR(nuvens[0], nuvens[i], voxel_size)
-            time_FGR = time.time()-ini
-            print(f"Pair 0->{i} time taken: {round(time_FGR)} sec")
-            print(f"Pair 0->{i} fitness: {result_FGR.fitness}")
-            print(f"Pair 0->{i} RMSE: {result_FGR.inlier_rmse}")
-            times_FGR.append(time_FGR)
-            results_FGR.append(result_FGR)
-            # Draw registration result
-            myf.desenhar_resultado_registro(nuvens[0], nuvens[i], result_FGR.transformation)
-    
-    # Plot times taken
-    print(f"Time taken by FGR in all pairs: {sum(np.round(times_FGR))} sec")
-    myf.plot_bar_time(times_FGR)
-    
-    
-    # Calculate absolute poses and apply them.
-    relative_poses_FGR = [results_FGR[i].transformation for i in range(n_nuvens)]
-    absolute_poses_FGR = myf.poses_relativas_para_absolutas(relative_poses_FGR[0:n_nuvens-1])
-    myf.apply_poses_in_clouds(absolute_poses_FGR, nuvens)
-    
-    
-    # PART 2 - APPLY M-GICP REFINEMENT IN ALL PAIRS
-    times_GICP = []
-    results_GICP = []
-    initial_Ts = results_FGR
-    # Multiscale-GICP loop
-    for i in range(n_nuvens):
-        # Odometry case: 2 => 1, 3 => 2, n+1 => n
-        if i < n_nuvens-1:
-            print(f"Registering cloud {i+1} in cloud {i} with M-GICP")
-            ini = time.time()
-            result_GICP, _ = myf.multiscale_GICP(nuvens[i+1], nuvens[i], voxel_size, initial_Ts[i].transformation)
-            time_GICP = time.time()-ini
-            print(f"Pair {i+1}->{i} time taken: {round(time_GICP)} sec")
-            print(f"Pair {i+1}->{i} fitness: {result_GICP.fitness}")
-            print(f"Pair {i+1}->{i} RMSE: {result_GICP.inlier_rmse}")
-            times_GICP.append(time_GICP)
-            results_GICP.append(result_GICP)
-            # Draw registration result
-            myf.desenhar_resultado_registro(nuvens[i+1], nuvens[i], result_GICP.transformation)
-        # Loop-closure case: first_cloud => last_cloud
-        elif i == n_nuvens-1:
-            print(f"Registering cloud 0 in cloud {i} with M-GICP")
-            ini = time.time()
-            result_GICP, _ = myf.multiscale_GICP(nuvens[0], nuvens[i], voxel_size, initial_Ts[i].transformation)
-            time_GICP = time.time()-ini
-            print(f"Pair 0->{i} time taken: {round(time_GICP)} sec")
-            print(f"Pair 0->{i} fitness: {result_GICP.fitness}")
-            print(f"Pair 0->{i} RMSE: {result_GICP.inlier_rmse}")
-            times_GICP.append(time_GICP)
-            results_GICP.append(result_GICP)
-            # Draw registration result
-            myf.desenhar_resultado_registro(nuvens[0], nuvens[i], result_GICP.transformation)
-    
-    print(f"Time taken by multi-scale GICP in all pairs: {round(sum(times_GICP))} sec")
-    myf.plot_bar_time(times_GICP)
-    
-    
-    # Calculate absolute poses with relative poses and apply them.
-    relative_poses_GICP = [results_GICP[i].transformation for i in range(n_nuvens)]
-    absolute_poses_GICP = myf.poses_relativas_para_absolutas(relative_poses_GICP)
-    myf.apply_poses_in_clouds(absolute_poses_GICP, nuvens)
+# IMPORT GROUNDTRUTH AND SUBTRACT POSES
+groundtruth = [np.loadtxt(f"groundtruth/NCLT/pose{i}.txt") for i in range(n_clouds)]
+distances_R, distances_t = subtract_squared_poses(absolute_poses_FGR, groundtruth)
 
 
-'''
-# SAVE PAIRWISE TRANSFORMATIONS (FGR coarse and GICP refined relative poses)
-for i in range(n_nuvens):
-    if i < n_nuvens-1:
-        # Odometric relative poses:
-        np.savetxt(f"relative_poses_FGR/{dataset}/pose_{i+1}_{i}.txt", results_FGR[i].transformation, fmt="%.10f")
-        np.savetxt(f"relative_poses_FGR_GICP/{dataset}/pose_{i+1}_{i}.txt", results_GICP[i].transformation, fmt="%.10f")
-    elif i == n_nuvens-1:
-        # Loop-closure relative pose:
-        np.savetxt(f"relative_poses_FGR/{dataset}/pose_0_{i}.txt", results_FGR[i].transformation, fmt="%.10f")
-        np.savetxt(f"relative_poses_FGR_GICP/{dataset}/pose_0_{i}.txt", results_GICP[i].transformation, fmt="%.10f")
-'''
+# PLOT POSE ERROR (DIFERENCES IN TRANSLATION)
+plt.plot(distances_t, label = "FGR")
+# Name X and Y axis
+plt.xlabel('Absolute poses')
+plt.ylabel('Error (m)')
+plt.grid(True)
+plt.legend()
+plt.show()
 
-# TODO: Add Trees dataset
+
+# SAVE TRANSFORMATIONS
+for i in range(n_clouds):
+    np.savetxt(f"relative_poses_FGR/NCLT/pose_{i+1}_{i}.txt", results_FGR[i].transformation, fmt="%.10f")
