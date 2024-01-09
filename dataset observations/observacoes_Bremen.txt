@@ -1,3 +1,0 @@
-All pairwise registrations of Bremen dataset are perfectly fine.
-All relative poses were inspected and no gross errors were found.
-Poses inspected -> relative_poses_FGR_GICP
