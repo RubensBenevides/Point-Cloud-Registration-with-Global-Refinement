@@ -7,9 +7,13 @@ import pandas as pd
 
 
 # SCRIPT TO DO COARSE PAIRWISE REGISTRATION USING FAST GLOBAL REGISTRATION
-# ON NCLT DATASET
+# IN ALL SEQUENTIAL PAIRS OF THE NCLT DATASET UNTIL CLOSE A CIRCUIT
 
 
+# Fuction to subtract two list of poses in numpy arrays.
+# INPUT: (list_poses_1,list_poses_2) 4x4 numpy matrices in a list.
+# OUTPUT: two lists of distances (distances_R, distances_t)
+# distances_R = list of rotations distances; distances_t = list of euclidean distances
 def subtract_squared_poses(list_poses_1, list_poses_2):
     # Check length
     if len(list_poses_1) != len(list_poses_2):
@@ -89,7 +93,7 @@ def apply_poses_in_clouds(lista_poses,lista_nuvens):
 # Function to compose relative poses to absolute poses
 # INPUT: T_circuito = list of relative poses: T10, T21, T32, ... Tn_n-1
 # OUTPUT: List of absolute poses: T10, T20, T30, ... Tn_0
-def poses_relativas_para_absolutas(T_circuito):
+def relative_to_absolute_poses(T_circuito):
     # obter lista de rotacoes para a origem por composicao multiplicativa
     lista_rotacoes_origem = []
     for i in range(len(T_circuito)):
@@ -123,7 +127,7 @@ n_clouds = 901
 clouds = [o3d.io.read_point_cloud(f"nuvens/nuvens_pre_processadas/NCLT/s{i}.pcd") for i in range(n_clouds)]
 
 
-# FGR REGISTRATION LOOP FOR CIRCUIT PAIRS
+# Apply FGR in all pairs of the circuit (1->0,2->1, and so on until 0->n)
 voxel_size = 0.1
 results_FGR = []
 times_FGR = []
@@ -145,15 +149,16 @@ for i in range(n_clouds):
 
 # RECOVER ABSOLUTES POSES FROM RELATIVE POSES
 relative_poses_FGR = [results_FGR[i].transformation for i in range(n_clouds)]
-absolute_poses_FGR = poses_relativas_para_absolutas(relative_poses_FGR)
+absolute_poses_FGR = relative_to_absolute_poses(relative_poses_FGR)
 
 
-# DRAW RESULT
+# Apply absolute poses in the clouds and DRAW
 apply_poses_in_clouds(absolute_poses_FGR, clouds)
 
 
-# IMPORT GROUNDTRUTH AND SUBTRACT POSES
+# IMPORT GROUNDTRUTH 
 groundtruth = [np.loadtxt(f"groundtruth/NCLT/pose{i}.txt") for i in range(n_clouds)]
+# SUBTRACT estimated poses by FGR and the groundtruth
 distances_R, distances_t = subtract_squared_poses(absolute_poses_FGR, groundtruth)
 
 
