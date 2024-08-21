@@ -7,7 +7,6 @@ from matplotlib import pyplot as plt
 
 
 # Function to draw registration result and preserv the original cloud.
-# Both temporary clouds will be painted with random colors.
 def desenhar_resultado_registro(source, target, transformation):
     source_temp = copy.deepcopy(source)
     target_temp = copy.deepcopy(target)
@@ -42,9 +41,9 @@ def apply_poses_in_clouds(lista_poses,lista_nuvens):
 
 
 # Function to compose relative poses to absolute poses
-# INPUT: T_circuito = list of relative poses: T10, T21, T32, ... Tn_n-1
-# OUTPUT: List of absolute poses: T10, T20, T30, ... Tn_0
-def poses_relativas_para_absolutas(T_circuito):
+# INPUT: T_circuito = list of relative poses: T10, T21, T32, ... Tn_n-1 (numpy 4x4 arrays)
+# OUTPUT: List of absolute poses: T10, T20, T30, ... Tn_0 (numpy 4x4 arrays)
+def relative_to_absolute_poses(T_circuito):
     # obter lista de rotacoes para a origem por composicao multiplicativa
     lista_rotacoes_origem = []
     for i in range(len(T_circuito)):
@@ -74,9 +73,9 @@ def poses_relativas_para_absolutas(T_circuito):
 
 
 # This fuction read 2 list of poses and subtract them. Return two lists 
-# of distances: euclidean distances for pairs of translations; 
+# of distances: euclidean distances for pairs of translations and
 # Frobenious distances for pairs of rotations.
-# INPUT: 2 lists with n poses each. OUTPUT: 2 lists of n distances (rot + trans).   
+# INPUT: 2 lists with n poses (4x4 arrays) each. OUTPUT: 2 lists of n distances (scalars).   
 def subtract_squared_poses(list_poses_1, list_poses_2):
     # Check length
     if len(list_poses_1) != len(list_poses_2):
@@ -96,13 +95,20 @@ def subtract_squared_poses(list_poses_1, list_poses_2):
     return distances_R, distances_t
 
 
+# Function to create a linear array of decreasing voxel sizes given a number of scaler
+# The voxel sizes will be used in the Multiscale-GICP to downsample the clouds. 
+# Input: n_scales = integer number of scales.
+# Outout: voxel_radius = list of scales.
 def create_scales(n_scales):
-    voxel_radios = 0.1
-    voxel_radios = [voxel_radios+(0.1*i) for i in range(n_scales)]
-    voxel_radios.reverse()
-    return voxel_radios
+    voxel_radius = 0.1
+    voxel_radius = [voxel_radius+(0.1*i) for i in range(n_scales)]
+    voxel_radius.reverse()
+    return voxel_radius
 
 
+# Function to create a array of decreasing max correspondence distances
+# Fuction used in the M-GICP to decrease the search readius of the GICP along the scales.
+# It just multiply the voxel sizes in the array scales by a pre-defined scalar.
 def max_correspondence_distances(scales):
     n_scales = len(scales)
     if n_scales == 3:
@@ -163,13 +169,13 @@ n_clouds = 901
 clouds = [o3d.io.read_point_cloud(f"nuvens/nuvens_pre_processadas/NCLT/s{i}.pcd") for i in range(n_clouds)]
 
 
-# 2 - LOAD RELATIVE POSES (PREVIOUSLY ESTIMATED BY FGR)
+# 2 - LOAD RELATIVE POSES (PREVIOUSLY ESTIMATED BY THE FAST GLOBAL REGISTRATION ALGORITHM)
 relative_poses_FGR = [np.loadtxt(f"relative_poses_FGR/NCLT/pose_{i+1}_{i}.txt") for i in range(n_clouds-1)]
 loop_closure = np.loadtxt(f"relative_poses_FGR/NCLT/pose_0_900.txt")
 relative_poses_FGR.append(loop_closure)
 
-'''
-# 3 - APPLY MULTISCALE M-GICP REFINEMENT 
+
+# 3 - APPLY THE MULTISCALE GICP IN ALL PAIRS OF THE CIRCUIT 
 # Initialize lists
 times_GICP = []
 results_GICP = []
@@ -213,18 +219,7 @@ relative_poses_FGR_GICP = [results_GICP[i].transformation for i in range(n_cloud
 
 
 # 5 - TRANSFORM RELATIVE POSES TO ABSOLUTE POSES
-absolute_poses_FGR_GICP = poses_relativas_para_absolutas(relative_poses_FGR_GICP)
-'''
-
-
-# USE THIS TO NOT REPRODUCE ALL REGISTRATIONS AGAIN
-# LOAD ALREADY SAVED M-GICP REFINED POSES
-# Relative poses
-relative_poses_FGR_GICP = [np.loadtxt(f"relative_poses_FGR_GICP/NCLT/pose_{i+1}_{i}.txt") for i in range(n_clouds-1)]
-loop_closure = np.loadtxt(f"relative_poses_FGR_GICP/NCLT/pose_0_900.txt")
-relative_poses_FGR_GICP.append(loop_closure)
-# Absolute poses
-absolute_poses_FGR_GICP = [np.loadtxt(f"absolute_poses_FGR_GICP/NCLT/pose{i}.txt") for i in range(n_clouds)]
+absolute_poses_FGR_GICP = relative_to_absolute_poses(relative_poses_FGR_GICP)
 
 
 # 6 - DRAW CIRCUIT
@@ -236,7 +231,7 @@ groundtruth = [np.loadtxt(f"groundtruth/NCLT/pose{i}.txt") for i in range(n_clou
 
 
 # 8 - SUBTRACT POSES
-absolute_poses_FGR = poses_relativas_para_absolutas(relative_poses_FGR)
+absolute_poses_FGR = relative_to_absolute_poses(relative_poses_FGR)
 distances_R_1, distances_t_1 = subtract_squared_poses(absolute_poses_FGR, groundtruth)
 distances_R_1, distances_t_2 = subtract_squared_poses(absolute_poses_FGR_GICP, groundtruth)
 
